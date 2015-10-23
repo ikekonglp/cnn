@@ -307,6 +307,7 @@ struct ZerothOrderSemiCRF {
     vector<Expression> fwd(len+1);  // fwd trellis for model
     vector<Expression> ref_fwd(len+1); // fwd trellis for reference
     vector<Expression> f, fr;
+
     // careful: in the other algorithms spans are [i,j], here they are [i,j)
     for (int j = 1; j <= len; ++j) {
       // fwd[j] is the total unnoramlized probability for all segmentations / labels
@@ -336,12 +337,130 @@ struct ZerothOrderSemiCRF {
           }
         }
       }
+      // cerr << "info\t" << j << "\tsize: " << f.size() << endl;
+      // for(auto& e : f){
+      //   cerr << "node\t" << as_scalar(cg.get_value(e.i)) << endl;
+      // }
+      // cerr << "size of vector f at j = " << j << " equals " << f.size() << endl;
+      // cerr << "info end" << endl;
       fwd[j] = logsumexp(f);
+
+      // cerr << "shock me\t" << as_scalar(cg.get_value((fwd[j]))) << endl;
+
       if (fr.size()) ref_fwd[j] = logsumexp(fr);
     }
     //return log(fwd.back()) - log(ref_fwd.back());
     return fwd.back() - ref_fwd.back();
   }
+
+  Expression ViterbiDecode(const vector<int>& x,
+                            const vector<pair<int,int>>& yz_gold,  // .first = y, .second = duration (z)
+                            ComputationGraph& cg,
+                            int max_seg_len = 0) {
+    int len = x.size();
+
+    xe->new_graph(cg);
+    ye->new_graph(cg);
+    de->new_graph(cg);
+    Expression d2h1 = parameter(cg, p_d2h1);
+    Expression y2h1 = parameter(cg, p_y2h1);
+    Expression fwd2h1 = parameter(cg, p_fwd2h1);
+    Expression rev2h1 = parameter(cg, p_rev2h1);
+    Expression h1b = parameter(cg, p_h1b);
+    Expression h12h2 = parameter(cg, p_h12h2);
+    Expression h2b = parameter(cg, p_h2b);
+    Expression h22o = parameter(cg, p_h22o);
+    Expression ob = parameter(cg, p_ob);
+    vector<Expression> xins(x.size());
+    for (int i = 0; i < len; ++i)
+      xins[i] = xe->embed(x[i]);
+    vector<Expression> c = bt.transcribe(cg, xins);
+    seb.construct_chart(cg, c, max_seg_len);
+    vector<Expression> fwd(len+1);  // fwd trellis for model
+    vector<Expression> f, fr;
+    vector<std::tuple<int, int, unsigned>> ijt; // ijt stores positions where we get the max (i.e. i, j and tag)
+    vector<std::tuple<int, int, unsigned>> it; // it stores positions where we get the max ending at j
+    it.push_back(make_tuple(0,0,0)); // push one to make the index consistent, now it[j] means j rather than j+1
+    // careful: in the other algorithms spans are [i,j], here they are [i,j)
+    for (int j = 1; j <= len; ++j) {
+      // fwd[j] is the total unnoramlized probability for all segmentations / labels
+      // ending (and including) the symbol at position j-1
+      f.clear(); // f stores all additive contributions to item [j]
+      fr.clear();
+      ijt.clear();
+      for (unsigned tag = 0; tag < TAG_SIZE; ++tag) {
+        Expression y = ye->embed(tag);
+        const int i_start = max_seg_len ? max(0, j - max_seg_len) : 0;
+        for (int i = i_start; i < j; ++i) {  // i is the starting position
+          auto seg_embedding_ij = seb(i, j-1); // pair<expr, expr>
+          Expression d = de->embed(j - i);
+          // factor includes: fwd embedding, rev embedding, duration embedding, label embedding
+          Expression h1 = rectify(affine_transform({h1b, d2h1, d, y2h1, y, fwd2h1, seg_embedding_ij.first, rev2h1, seg_embedding_ij.second}));
+          Expression h2 = tanh(affine_transform({h2b, h12h2, h1}));
+          //Expression p = exp(affine_transform({ob, h22o, h2}));
+          Expression p = affine_transform({ob, h22o, h2});
+
+          if (i == 0) { // fwd[0] is the path up and including -1, so it's the empty set, i.e., its probability is 1
+            f.push_back(p);
+          } else {
+            f.push_back(p + fwd[i]);
+          }
+          ijt.push_back(std::make_tuple(i, j, tag));
+        }
+      }
+      // cerr << "size of vector f at j = " << j << " equals " << f.size() << endl;
+      unsigned max_ind = 0;
+      auto max_val = as_scalar(cg.get_value(f[0].i));
+      for(auto ind = 1; ind < f.size(); ++ind){
+        auto val = as_scalar(cg.get_value(f[ind].i));
+        // cerr << val << endl;
+        if (max_val < val){
+          max_val = val;
+          max_ind = ind;
+        }
+      }
+      fwd[j] = f[max_ind];
+      it.push_back(ijt[max_ind]);
+      // cerr << "max value = \t" << as_scalar(cg.get_value(fwd[j])) << endl;
+    }
+    // for(auto j = 1; j <= len; ++j) {
+    //   cerr << j << "\t" << std::get<0>(it[j]) << "\t" << std::get<1>(it[j]) << "\t" << std::get<2>(it[j]) << endl;
+    // }
+    auto cur_j = len;
+    vector<std::tuple<int, int, unsigned>> pred;
+    vector<pair<int,int>> yz_pred;
+    while(cur_j > 0){
+      auto cur_i = std::get<0>(it[cur_j]);
+      pred.push_back(make_tuple(cur_i, cur_j, std::get<2>(it[cur_j])));
+      yz_pred.push_back(make_pair(std::get<2>(it[cur_j]), cur_j - cur_i));
+      cur_j = cur_i;
+    }
+    std::reverse(pred.begin(),pred.end());
+    std::reverse(yz_pred.begin(),yz_pred.end());
+    cout << "==pred==" << endl;
+    // for(auto e : pred){
+    //   cout << std::get<0>(e) << "\t" << std::get<1>(e) << "\t" << std::get<2>(e) << endl;
+    // }
+
+    for(auto e: yz_pred){
+      cout << e.first << "," << e.second << "\t";
+    }
+    cout << endl;
+
+    cout << "==gold==" << endl;
+    for(auto e: yz_gold){
+      cout << e.first << "," << e.second << "\t";
+    }
+    cout << endl;
+
+    // abort();
+    return fwd.back();
+  }
+  
+
+  
+
+
   Parameters* p_d2h1, *p_y2h1, *p_fwd2h1, *p_rev2h1, *p_h1b;
   Parameters* p_h12h2, *p_h2b;
   Parameters* p_h22o, *p_ob;
@@ -429,7 +548,7 @@ int main(int argc, char** argv) {
   }
 
   unsigned report_every_i = 10;
-  unsigned dev_every_i_reports = 5;
+  unsigned dev_every_i_reports = 10;
   unsigned si = training.size();
   vector<unsigned> order(training.size());
   for (unsigned i = 0; i < order.size(); ++i) order[i] = i;
@@ -446,7 +565,7 @@ int main(int argc, char** argv) {
         si = 0;
         if (first) { first = false; } else { sgd->update_epoch(); }
         cerr << "**SHUFFLE\n";
-        shuffle(order.begin(), order.end(), *rndeng);
+        // shuffle(order.begin(), order.end(), *rndeng);
       }
 
       // build graph for this instance
@@ -471,7 +590,9 @@ int main(int argc, char** argv) {
         crf.SupervisedLoss(sent.first, sent.second, cg);
         dtags += sent.second.size();
         dloss += as_scalar(cg.forward());
+        crf.ViterbiDecode(sent.first, sent.second, cg);
       }
+      cout << "iter_end" << endl;
       if (dloss < best) {
         best = dloss;
         ofstream out(fname);
